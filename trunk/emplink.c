@@ -9,7 +9,7 @@
  *
  */
 
-#include <linux/config.h>
+//#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/errno.h>
@@ -26,6 +26,12 @@
 #else
 #include <../drivers/usb/serial/usb-serial.h>
 #endif
+
+struct emplink_private {
+    struct usb_serial_port *port;
+    struct timer_list timer;
+    struct work_struct queue;
+};
 
 static int debug;
 
@@ -128,18 +134,15 @@ void usb_serial_emplink_deregister (void)
 	usb_serial_deregister (&usb_serial_emplink_device);
 }
 
-struct timer_list timer;
-struct work_struct queue;
-DECLARE_WAIT_QUEUE_HEAD (emplink_wait);
-
-void queue_routine(void *l_port)
+void queue_routine(struct work_struct *w_struct)
 {
+    struct emplink_private *priv = container_of(w_struct, struct emplink_private, queue);
+    struct usb_serial_port *port = priv->port;
+
     int ret = 0;
-    struct usb_serial_port *port = (struct usb_serial_port*)l_port;
     struct usb_device *dev;
     short length;
-    char buf[100];
-    int i;
+    char *buf;
     
     
     if (port) {
@@ -150,42 +153,39 @@ void queue_routine(void *l_port)
     }
     
     if (dev) {
-        dbg("Sending control URB");
+//        dbg("Sending control URB");
         ret = usb_control_msg(dev,
 		    usb_rcvctrlpipe(dev,0),
 		    0x01,
 		    (USB_TYPE_VENDOR | USB_DIR_IN),
 		    0x00,0x00,&length,sizeof(length),HZ/20);
-        dbg("Device returned %i bytes",ret);
-        if (ret == 2); {
+//        dbg("Device returned %i bytes",ret);
+        if (ret == 2 && length > 0) {
 	    dbg("%s: returned value = 0x%i",__FUNCTION__,length);
-	    if (length > 0) {
-		memset(buf,0,sizeof(buf));
-	        ret = usb_control_msg(dev,
-			    usb_rcvctrlpipe(dev,0),
-	    		    0x02,
-			    (USB_TYPE_VENDOR | USB_DIR_IN),
-			    0x00,0x00,buf,sizeof(buf)-1,HZ/20);
-		if (ret > 0) {
-		    dbg("Device returned %s", buf);
-		    tty_buffer_request_room(port->tty,ret);
-		    for (i=0; i < ret; i++) {
-    			tty_insert_flip_char(port->tty,buf[i],TTY_NORMAL);
-		    }
-		    tty_flip_buffer_push(port->tty);
-		}
+    	    buf = (char*)kzalloc(length+1,GFP_KERNEL);
+	    ret = usb_control_msg(dev,
+		    usb_rcvctrlpipe(dev,0),
+		    0x02,
+		    (USB_TYPE_VENDOR | USB_DIR_IN),
+		    0x00,0x00,buf,length,HZ/20);
+	    if (ret > 0) {
+	        dbg("Device returned %s", buf);
+		tty_buffer_request_room(port->tty,ret);
+    		tty_insert_flip_string(port->tty,buf,ret);
+		tty_flip_buffer_push(port->tty);
 	    }
+	    kfree(buf);
 	}
     } else {
 	dbg("Passed invalid *dev");
     }
-    wake_up_interruptible(&emplink_wait);
 }
 
-void emplink_timer(unsigned long nil)
+void emplink_timer(unsigned long priv_ptr)
 {
-    schedule_work(&queue);
-    mod_timer(&timer,jiffies+HZ/10);
+    struct emplink_private *priv = (struct emplink_private*)priv_ptr;
+    schedule_work(&priv->queue);
+    mod_timer(&priv->timer,jiffies+HZ/10);
 }
 
 
@@ -194,34 +194,44 @@ int emplink_open (struct usb_serial_port *port, struct file *filp)
 //	struct usb_serial *serial = port->serial;
 //	int result = 0;
 
+	struct emplink_private *priv;
+	
 	dbg("%s - port %d", __FUNCTION__, port->number);
 
 	/* force low_latency on so that our tty_push actually forces the data through, 
 	   otherwise it is scheduled, and with high data rates (like with OHCI) data
 	   can get lost. */
+	priv = kmalloc(sizeof(struct emplink_private),GFP_KERNEL);
+	if (!priv)
+	    return 1;
+	    
+	usb_set_serial_port_data(port,priv);
 	if (port->tty)
 		port->tty->low_latency = 1;
 	
 	// Insert some characters in the port
 
-	INIT_WORK(&queue,queue_routine,port);
+	priv->port = port;
+	INIT_WORK(&priv->queue,queue_routine);
 	
-	init_timer(&timer);
-	timer.function=emplink_timer;
-	timer.data = 0;
-	timer.expires = jiffies;
+	init_timer(&priv->timer);
+	priv->timer.function = emplink_timer;
+	priv->timer.data = (unsigned long)priv;
+	priv->timer.expires = jiffies;
 	
-	add_timer(&timer);
+	add_timer(&priv->timer);
 	return 0;
 }
 
 void emplink_close(struct usb_serial_port *port, struct file* filp)
 {
+    struct emplink_private *priv;
+    priv = usb_get_serial_port_data(port);
      dbg("%s",__FUNCTION__);
-    del_timer_sync(&timer);
-    cancel_delayed_work(&queue);
-    schedule_work(&queue);
-    interruptible_sleep_on(&emplink_wait);
+    del_timer_sync(&priv->timer);
+    cancel_work_sync(&priv->queue);
+
+    kfree(usb_get_serial_port_data(port));
     emplink_cleanup(port);
     
 }
